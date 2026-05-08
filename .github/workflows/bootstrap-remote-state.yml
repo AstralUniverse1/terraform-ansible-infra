@@ -87,23 +87,28 @@ jobs:
 
           terraform apply -auto-approve
 
-      - name: Generate backend config for smoke stack
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          cat > backend.auto.tfbackend <<EOF
-          bucket         = "${{ steps.names.outputs.state_bucket_name }}"
-          key            = "${{ inputs.state_key }}"
-          region         = "${{ inputs.aws_region }}"
-          dynamodb_table = "${{ steps.names.outputs.lock_table_name }}"
-          encrypt        = true
-          EOF
-
       - name: Initialize and write remote smoke state
         working-directory: ${{ env.SMOKE_DIR }}
         run: |
           set -euo pipefail
 
-          terraform init -backend-config=backend.auto.tfbackend
+          for attempt in 1 2 3; do
+            if terraform init -reconfigure \
+              -backend-config="bucket=${{ steps.names.outputs.state_bucket_name }}" \
+              -backend-config="key=${{ inputs.state_key }}" \
+              -backend-config="region=${{ inputs.aws_region }}" \
+              -backend-config="dynamodb_table=${{ steps.names.outputs.lock_table_name }}" \
+              -backend-config="encrypt=true"; then
+              break
+            fi
+
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+
+            sleep 15
+          done
+
           terraform validate
           terraform apply -auto-approve
 
