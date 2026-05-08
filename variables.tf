@@ -1,11 +1,12 @@
 variable "aws_region" {
   type    = string
-  default = "ap-northeast-1" # tokyo - example region
+  default = "il-central-1"
 }
 
 variable "ami_id" {
-  type    = string
-  default = "ami-0b7546e839d7ace12" # example in tokyo region
+  description = "Optional AMI override. When null, the latest regional Amazon Linux 2023 x86_64 AMI is resolved from SSM."
+  type        = string
+  default     = null
 }
 
 variable "instance_type" {
@@ -27,7 +28,7 @@ variable "sg_name" {
   default = "default_sg" # example security group name
 }
 
-variable "ingress_rules" { 
+variable "ingress_rules" {
   type = list(object({
     from_port   = number
     to_port     = number
@@ -72,5 +73,5 @@ variable "subnet_cidr" {
 }
 variable "az" {
   type    = string
-  default = "ap-northeast-1a" # example availability zone in tokyo
+  default = "il-central-1a"
 }

@@ -1,0 +1,120 @@
+name: Bootstrap Remote State
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region for the backend resources"
+        required: true
+        default: "il-central-1"
+        type: string
+      name_prefix:
+        description: "Lowercase name prefix for backend resources"
+        required: true
+        default: "terraform-ansible-infra"
+        type: string
+      state_key:
+        description: "Remote state key used by the backend smoke stack"
+        required: true
+        default: "examples/backend-smoke.tfstate"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    env:
+      BOOTSTRAP_DIR: bootstrap/remote-state
+      SMOKE_DIR: examples/backend-smoke
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Derive backend names
+        id: names
+        run: |
+          set -euo pipefail
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          prefix="${{ inputs.name_prefix }}"
+          region="${{ inputs.aws_region }}"
+
+          state_bucket_name="${prefix}-${account_id}-${region}-tfstate"
+          lock_table_name="${prefix}-${region}-tf-locks"
+
+          {
+            echo "account_id=${account_id}"
+            echo "state_bucket_name=${state_bucket_name}"
+            echo "lock_table_name=${lock_table_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Bootstrap remote-state resources
+        working-directory: ${{ env.BOOTSTRAP_DIR }}
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_state_bucket_name: ${{ steps.names.outputs.state_bucket_name }}
+          TF_VAR_lock_table_name: ${{ steps.names.outputs.lock_table_name }}
+        run: |
+          set -euo pipefail
+
+          terraform init
+          terraform validate
+
+          terraform import aws_s3_bucket.state "$TF_VAR_state_bucket_name" || true
+          terraform import aws_s3_bucket_public_access_block.state "$TF_VAR_state_bucket_name" || true
+          terraform import aws_s3_bucket_server_side_encryption_configuration.state "$TF_VAR_state_bucket_name" || true
+          terraform import aws_s3_bucket_versioning.state "$TF_VAR_state_bucket_name" || true
+          terraform import aws_dynamodb_table.locks "$TF_VAR_lock_table_name" || true
+
+          terraform apply -auto-approve
+
+      - name: Generate backend config for smoke stack
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          cat > backend.auto.tfbackend <<EOF
+          bucket         = "${{ steps.names.outputs.state_bucket_name }}"
+          key            = "${{ inputs.state_key }}"
+          region         = "${{ inputs.aws_region }}"
+          dynamodb_table = "${{ steps.names.outputs.lock_table_name }}"
+          encrypt        = true
+          EOF
+
+      - name: Initialize and write remote smoke state
+        working-directory: ${{ env.SMOKE_DIR }}
+        run: |
+          set -euo pipefail
+
+          terraform init -backend-config=backend.auto.tfbackend
+          terraform validate
+          terraform apply -auto-approve
+
+      - name: Summarize backend
+        run: |
+          {
+            echo "## Remote Backend Bootstrap"
+            echo
+            echo "- AWS account: \`${{ steps.names.outputs.account_id }}\`"
+            echo "- Region: \`${{ inputs.aws_region }}\`"
+            echo "- State bucket: \`${{ steps.names.outputs.state_bucket_name }}\`"
+            echo "- Lock table: \`${{ steps.names.outputs.lock_table_name }}\`"
+            echo "- Smoke state key: \`${{ inputs.state_key }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
