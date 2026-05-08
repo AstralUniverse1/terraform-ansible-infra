@@ -1,0 +1,81 @@
+---
+- name: Configure EC2 host with CloudWatch Agent log shipping
+  hosts: cloudwatch_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    cloudwatch_region: il-central-1
+    cloudwatch_log_group_name: /terraform-ansible-infra/ec2-cloudwatch-agent
+    cloudwatch_log_stream_name: "{{ inventory_hostname }}"
+    marker_log_path: /var/log/terraform-ansible-cloudwatch-marker.log
+    marker_message: terraform-ansible-cloudwatch-marker
+
+  tasks:
+    - name: Install CloudWatch Agent
+      ansible.builtin.dnf:
+        name: amazon-cloudwatch-agent
+        state: present
+
+    - name: Create CloudWatch Agent configuration directory
+      ansible.builtin.file:
+        path: /opt/aws/amazon-cloudwatch-agent/etc
+        state: directory
+        mode: "0755"
+
+    - name: Write CloudWatch Agent configuration
+      ansible.builtin.copy:
+        dest: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+        mode: "0644"
+        content: |
+          {
+            "agent": {
+              "region": "{{ cloudwatch_region }}"
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "{{ marker_log_path }}",
+                      "log_group_name": "{{ cloudwatch_log_group_name }}",
+                      "log_stream_name": "{{ cloudwatch_log_stream_name }}",
+                      "timezone": "UTC"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+
+    - name: Create marker log file
+      ansible.builtin.file:
+        path: "{{ marker_log_path }}"
+        state: touch
+        mode: "0644"
+
+    - name: Start CloudWatch Agent with file configuration
+      ansible.builtin.command:
+        argv:
+          - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+          - -a
+          - fetch-config
+          - -m
+          - ec2
+          - -c
+          - file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          - -s
+      changed_when: true
+
+    - name: Write unique marker log event
+      ansible.builtin.lineinfile:
+        path: "{{ marker_log_path }}"
+        line: "{{ marker_message }}"
+        create: true
+        mode: "0644"
+
+    - name: Verify CloudWatch Agent service is running
+      ansible.builtin.service:
+        name: amazon-cloudwatch-agent
+        state: started
+        enabled: true

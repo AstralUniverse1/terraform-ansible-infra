@@ -1,0 +1,271 @@
+name: EC2 CloudWatch Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region for the EC2 CloudWatch Agent host"
+        required: true
+        default: "il-central-1"
+        type: string
+      name_prefix:
+        description: "Lowercase name prefix for resources"
+        required: true
+        default: "terraform-ansible-infra"
+        type: string
+      state_key:
+        description: "Remote state key for this example stack"
+        required: true
+        default: "examples/ec2-cloudwatch-agent.tfstate"
+        type: string
+      destroy_on_failure:
+        description: "Destroy this example stack automatically if the workflow fails"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  provision-configure-verify:
+    runs-on: ubuntu-latest
+
+    env:
+      STACK_DIR: examples/ec2-cloudwatch-agent
+      PLAYBOOK: ansible/playbooks/cloudwatch-agent.yml
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.3
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install Ansible
+        run: |
+          set -euo pipefail
+
+          if ! command -v ansible-playbook >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ansible
+          fi
+
+      - name: Derive backend names
+        id: names
+        run: |
+          set -euo pipefail
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          prefix="${{ inputs.name_prefix }}"
+          region="${{ inputs.aws_region }}"
+
+          state_bucket_name="${prefix}-${account_id}-${region}-tfstate"
+          lock_table_name="${prefix}-${region}-tf-locks"
+
+          {
+            echo "account_id=${account_id}"
+            echo "state_bucket_name=${state_bucket_name}"
+            echo "lock_table_name=${lock_table_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate workflow SSH key and marker
+        id: runtime
+        run: |
+          set -euo pipefail
+
+          ssh_key_path="${RUNNER_TEMP}/ec2-cloudwatch-agent"
+          ssh-keygen -t ed25519 -N "" -f "$ssh_key_path" -C "github-actions-ec2-cloudwatch-agent"
+          chmod 600 "$ssh_key_path"
+
+          runner_public_ip="$(curl -fsS https://checkip.amazonaws.com | tr -d '\n')"
+          marker="terraform-ansible-cloudwatch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "private_key_path=${ssh_key_path}"
+            echo "public_key=$(cat "${ssh_key_path}.pub")"
+            echo "runner_public_ip=${runner_public_ip}"
+            echo "ssh_allowed_cidr=${runner_public_ip}/32"
+            echo "marker=${marker}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        working-directory: ${{ env.STACK_DIR }}
+        run: |
+          set -euo pipefail
+
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ steps.names.outputs.state_bucket_name }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="dynamodb_table=${{ steps.names.outputs.lock_table_name }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform validate
+        working-directory: ${{ env.STACK_DIR }}
+        run: terraform validate
+
+      - name: Terraform apply
+        working-directory: ${{ env.STACK_DIR }}
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_name_prefix: ${{ inputs.name_prefix }}
+          TF_VAR_ssh_public_key: ${{ steps.runtime.outputs.public_key }}
+          TF_VAR_ssh_allowed_cidr: ${{ steps.runtime.outputs.ssh_allowed_cidr }}
+        run: terraform apply -auto-approve
+
+      - name: Read Terraform outputs
+        id: tf_outputs
+        working-directory: ${{ env.STACK_DIR }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "instance_id=$(terraform output -raw instance_id)"
+            echo "public_ip=$(terraform output -raw public_ip)"
+            echo "ssh_user=$(terraform output -raw ssh_user)"
+            echo "log_group_name=$(terraform output -raw log_group_name)"
+            echo "log_stream_name=$(terraform output -raw log_stream_name)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Ansible inventory
+        run: |
+          set -euo pipefail
+
+          inventory_path="${RUNNER_TEMP}/inventory.ini"
+
+          {
+            echo "[cloudwatch_hosts]"
+            echo "${{ steps.tf_outputs.outputs.public_ip }} ansible_user=${{ steps.tf_outputs.outputs.ssh_user }} ansible_ssh_private_key_file=${{ steps.runtime.outputs.private_key_path }} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+          } > "$inventory_path"
+
+          echo "ANSIBLE_INVENTORY=${inventory_path}" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 40); do
+            if ssh \
+              -i "${{ steps.runtime.outputs.private_key_path }}" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              "${{ steps.tf_outputs.outputs.ssh_user }}@${{ steps.tf_outputs.outputs.public_ip }}" \
+              "true"; then
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          exit 1
+
+      - name: Run Ansible playbook
+        run: |
+          ansible-playbook -i "$ANSIBLE_INVENTORY" "$PLAYBOOK" \
+            -e "cloudwatch_region=${{ inputs.aws_region }}" \
+            -e "cloudwatch_log_group_name=${{ steps.tf_outputs.outputs.log_group_name }}" \
+            -e "cloudwatch_log_stream_name=${{ steps.tf_outputs.outputs.log_stream_name }}" \
+            -e "marker_message=${{ steps.runtime.outputs.marker }}"
+
+      - name: Verify marker reached CloudWatch Logs
+        run: |
+          set -euo pipefail
+
+          start_time="$((($(date +%s) - 300) * 1000))"
+
+          for attempt in $(seq 1 30); do
+            match_count="$(aws logs filter-log-events \
+              --region "${{ inputs.aws_region }}" \
+              --log-group-name "${{ steps.tf_outputs.outputs.log_group_name }}" \
+              --log-stream-names "${{ steps.tf_outputs.outputs.log_stream_name }}" \
+              --start-time "$start_time" \
+              --filter-pattern "\"${{ steps.runtime.outputs.marker }}\"" \
+              --query 'length(events)' \
+              --output text)"
+
+            if [ "$match_count" != "0" ]; then
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          exit 1
+
+      - name: Destroy stack after failure
+        if: ${{ failure() && inputs.destroy_on_failure && steps.names.outcome == 'success' && steps.runtime.outcome == 'success' }}
+        working-directory: ${{ env.STACK_DIR }}
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_name_prefix: ${{ inputs.name_prefix }}
+          TF_VAR_ssh_public_key: ${{ steps.runtime.outputs.public_key }}
+          TF_VAR_ssh_allowed_cidr: ${{ steps.runtime.outputs.ssh_allowed_cidr }}
+        run: |
+          set -euo pipefail
+
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ steps.names.outputs.state_bucket_name }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="dynamodb_table=${{ steps.names.outputs.lock_table_name }}" \
+            -backend-config="encrypt=true"
+
+          terraform destroy -auto-approve
+
+      - name: Summarize result
+        if: always()
+        run: |
+          {
+            echo "## EC2 CloudWatch Agent"
+            echo
+            echo "- AWS account: \`${{ steps.names.outputs.account_id }}\`"
+            echo "- Region: \`${{ inputs.aws_region }}\`"
+            echo "- State bucket: \`${{ steps.names.outputs.state_bucket_name }}\`"
+            echo "- Lock table: \`${{ steps.names.outputs.lock_table_name }}\`"
+            echo "- State key: \`${{ inputs.state_key }}\`"
+            echo "- Destroy on failure: \`${{ inputs.destroy_on_failure }}\`"
+            echo "- Runner SSH CIDR: \`${{ steps.runtime.outputs.ssh_allowed_cidr }}\`"
+            echo "- Marker: \`${{ steps.runtime.outputs.marker }}\`"
+            echo
+            echo "### Terraform Outputs"
+            echo
+            echo "- Instance ID: \`${{ steps.tf_outputs.outputs.instance_id }}\`"
+            echo "- Public IP: \`${{ steps.tf_outputs.outputs.public_ip }}\`"
+            echo "- Log group: \`${{ steps.tf_outputs.outputs.log_group_name }}\`"
+            echo "- Log stream: \`${{ steps.tf_outputs.outputs.log_stream_name }}\`"
+            echo
+            echo "### Manual Destroy"
+            echo
+            echo "\`\`\`bash"
+            echo "cd /home/john/Github_Projects/terraform-ansible-infra/examples/ec2-cloudwatch-agent"
+            echo "tmp_key=\"/tmp/ec2-cloudwatch-agent-destroy-key-\$(date +%s)\""
+            echo "ssh-keygen -q -t ed25519 -N \"\" -f \"\$tmp_key\""
+            echo "AWS_PROFILE=Astral terraform init -reconfigure \\"
+            echo "  -backend-config=\"bucket=${{ steps.names.outputs.state_bucket_name }}\" \\"
+            echo "  -backend-config=\"key=${{ inputs.state_key }}\" \\"
+            echo "  -backend-config=\"region=${{ inputs.aws_region }}\" \\"
+            echo "  -backend-config=\"dynamodb_table=${{ steps.names.outputs.lock_table_name }}\" \\"
+            echo "  -backend-config=\"encrypt=true\""
+            echo "AWS_PROFILE=Astral terraform destroy \\"
+            echo "  -var=\"aws_region=${{ inputs.aws_region }}\" \\"
+            echo "  -var=\"name_prefix=${{ inputs.name_prefix }}\" \\"
+            echo "  -var=\"ssh_allowed_cidr=127.0.0.1/32\" \\"
+            echo "  -var=\"ssh_public_key=\$(cat \${tmp_key}.pub)\""
+            echo "rm -f \"\$tmp_key\" \"\${tmp_key}.pub\""
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

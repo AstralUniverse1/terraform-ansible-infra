@@ -1,21 +1,21 @@
 output "instance_id" {
   description = "ID of the EC2 Docker host."
-  value       = aws_instance.docker_host.id
+  value       = module.public_ec2_host.instance_id
 }
 
 output "public_ip" {
   description = "Public IP address used by Ansible and the HTTP smoke test."
-  value       = aws_instance.docker_host.public_ip
+  value       = module.public_ec2_host.public_ip
 }
 
 output "ssh_user" {
   description = "Default SSH user for Amazon Linux 2023."
-  value       = "ec2-user"
+  value       = module.public_ec2_host.ssh_user
 }
 
 output "app_url" {
   description = "HTTP URL for the demo service configured by Ansible."
-  value       = "http://${aws_instance.docker_host.public_ip}:${var.app_port}"
+  value       = "http://${module.public_ec2_host.public_ip}:${var.app_port}"
 }
 
 output "state_cleanup_hint" {
