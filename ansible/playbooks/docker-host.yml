@@ -1,0 +1,113 @@
+---
+- name: Configure EC2 host as a Docker Compose server
+  hosts: docker_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/terraform-ansible-demo
+    app_port: 80
+
+  tasks:
+    - name: Install Docker
+      ansible.builtin.dnf:
+        name: docker
+        state: present
+
+    - name: Install Docker Compose plugin when available from package repositories
+      ansible.builtin.dnf:
+        name: docker-compose-plugin
+        state: present
+      register: compose_plugin_package
+      failed_when: false
+
+    - name: Ensure Docker service is enabled and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ec2-user to the docker group
+      ansible.builtin.user:
+        name: ec2-user
+        groups: docker
+        append: true
+
+    - name: Check Docker Compose plugin
+      ansible.builtin.command: docker compose version
+      register: compose_plugin_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker Compose plugin manually when package is unavailable
+      when: compose_plugin_check.rc != 0
+      block:
+        - name: Create Docker CLI plugin directory
+          ansible.builtin.file:
+            path: /usr/local/lib/docker/cli-plugins
+            state: directory
+            mode: "0755"
+
+        - name: Download Docker Compose plugin
+          ansible.builtin.get_url:
+            url: https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-x86_64
+            dest: /usr/local/lib/docker/cli-plugins/docker-compose
+            mode: "0755"
+
+        - name: Verify manually installed Docker Compose plugin
+          ansible.builtin.command: docker compose version
+          changed_when: false
+
+    - name: Create demo app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}/html"
+        state: directory
+        mode: "0755"
+
+    - name: Write demo web page
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/html/index.html"
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>Terraform Ansible Docker Host</title>
+          </head>
+          <body>
+            <h1>Terraform provisioned this EC2 host.</h1>
+            <p>Ansible installed Docker Compose and deployed this container.</p>
+          </body>
+          </html>
+
+    - name: Write Docker Compose file
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/docker-compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            web:
+              image: nginx:1.27-alpine
+              restart: unless-stopped
+              ports:
+                - "{{ app_port }}:80"
+              volumes:
+                - ./html:/usr/share/nginx/html:ro
+
+    - name: Start demo service with Docker Compose
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ app_dir }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stdout or 'Created' in compose_up.stdout or 'Recreated' in compose_up.stdout or 'Pulled' in compose_up.stdout"
+
+    - name: Verify demo service from the host
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}"
+        return_content: true
+        status_code: 200
+      register: local_http_check
+      retries: 12
+      delay: 5
+      until: local_http_check.status == 200 and 'Ansible installed Docker Compose' in local_http_check.content

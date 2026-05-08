@@ -1,0 +1,250 @@
+name: EC2 Docker Host
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region for the EC2 Docker host"
+        required: true
+        default: "il-central-1"
+        type: string
+      name_prefix:
+        description: "Lowercase name prefix for resources"
+        required: true
+        default: "terraform-ansible-infra"
+        type: string
+      state_key:
+        description: "Remote state key for this example stack"
+        required: true
+        default: "examples/ec2-docker-host.tfstate"
+        type: string
+      destroy_on_failure:
+        description: "Destroy this example stack automatically if the workflow fails"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  provision-configure:
+    runs-on: ubuntu-latest
+
+    env:
+      STACK_DIR: examples/ec2-docker-host
+      PLAYBOOK: ansible/playbooks/docker-host.yml
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.3
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install Ansible
+        run: |
+          set -euo pipefail
+
+          if ! command -v ansible-playbook >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ansible
+          fi
+
+      - name: Derive backend names
+        id: names
+        run: |
+          set -euo pipefail
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          prefix="${{ inputs.name_prefix }}"
+          region="${{ inputs.aws_region }}"
+
+          state_bucket_name="${prefix}-${account_id}-${region}-tfstate"
+          lock_table_name="${prefix}-${region}-tf-locks"
+
+          {
+            echo "account_id=${account_id}"
+            echo "state_bucket_name=${state_bucket_name}"
+            echo "lock_table_name=${lock_table_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate workflow SSH key
+        id: ssh
+        run: |
+          set -euo pipefail
+
+          ssh_key_path="${RUNNER_TEMP}/ec2-docker-host"
+          ssh-keygen -t ed25519 -N "" -f "$ssh_key_path" -C "github-actions-ec2-docker-host"
+          chmod 600 "$ssh_key_path"
+
+          runner_public_ip="$(curl -fsS https://checkip.amazonaws.com | tr -d '\n')"
+
+          {
+            echo "private_key_path=${ssh_key_path}"
+            echo "public_key=$(cat "${ssh_key_path}.pub")"
+            echo "runner_public_ip=${runner_public_ip}"
+            echo "ssh_allowed_cidr=${runner_public_ip}/32"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        working-directory: ${{ env.STACK_DIR }}
+        run: |
+          set -euo pipefail
+
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ steps.names.outputs.state_bucket_name }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="dynamodb_table=${{ steps.names.outputs.lock_table_name }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform validate
+        working-directory: ${{ env.STACK_DIR }}
+        run: terraform validate
+
+      - name: Terraform apply
+        working-directory: ${{ env.STACK_DIR }}
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_name_prefix: ${{ inputs.name_prefix }}
+          TF_VAR_ssh_public_key: ${{ steps.ssh.outputs.public_key }}
+          TF_VAR_ssh_allowed_cidr: ${{ steps.ssh.outputs.ssh_allowed_cidr }}
+        run: terraform apply -auto-approve
+
+      - name: Read Terraform outputs
+        id: tf_outputs
+        working-directory: ${{ env.STACK_DIR }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "instance_id=$(terraform output -raw instance_id)"
+            echo "public_ip=$(terraform output -raw public_ip)"
+            echo "ssh_user=$(terraform output -raw ssh_user)"
+            echo "app_url=$(terraform output -raw app_url)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Ansible inventory
+        run: |
+          set -euo pipefail
+
+          inventory_path="${RUNNER_TEMP}/inventory.ini"
+
+          {
+            echo "[docker_hosts]"
+            echo "${{ steps.tf_outputs.outputs.public_ip }} ansible_user=${{ steps.tf_outputs.outputs.ssh_user }} ansible_ssh_private_key_file=${{ steps.ssh.outputs.private_key_path }} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+          } > "$inventory_path"
+
+          echo "ANSIBLE_INVENTORY=${inventory_path}" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 40); do
+            if ssh \
+              -i "${{ steps.ssh.outputs.private_key_path }}" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              "${{ steps.tf_outputs.outputs.ssh_user }}@${{ steps.tf_outputs.outputs.public_ip }}" \
+              "true"; then
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          exit 1
+
+      - name: Run Ansible playbook
+        run: ansible-playbook -i "$ANSIBLE_INVENTORY" "$PLAYBOOK"
+
+      - name: Smoke test public HTTP endpoint
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 24); do
+            if curl -fsS "${{ steps.tf_outputs.outputs.app_url }}" | grep -q "Ansible installed Docker Compose"; then
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          exit 1
+
+      - name: Destroy stack after failure
+        if: ${{ failure() && inputs.destroy_on_failure && steps.names.outcome == 'success' && steps.ssh.outcome == 'success' }}
+        working-directory: ${{ env.STACK_DIR }}
+        env:
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_name_prefix: ${{ inputs.name_prefix }}
+          TF_VAR_ssh_public_key: ${{ steps.ssh.outputs.public_key }}
+          TF_VAR_ssh_allowed_cidr: ${{ steps.ssh.outputs.ssh_allowed_cidr }}
+        run: |
+          set -euo pipefail
+
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ steps.names.outputs.state_bucket_name }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="dynamodb_table=${{ steps.names.outputs.lock_table_name }}" \
+            -backend-config="encrypt=true"
+
+          terraform destroy -auto-approve
+
+      - name: Summarize result
+        if: always()
+        run: |
+          {
+            echo "## EC2 Docker Host"
+            echo
+            echo "- AWS account: \`${{ steps.names.outputs.account_id }}\`"
+            echo "- Region: \`${{ inputs.aws_region }}\`"
+            echo "- State bucket: \`${{ steps.names.outputs.state_bucket_name }}\`"
+            echo "- Lock table: \`${{ steps.names.outputs.lock_table_name }}\`"
+            echo "- State key: \`${{ inputs.state_key }}\`"
+            echo "- Destroy on failure: \`${{ inputs.destroy_on_failure }}\`"
+            echo "- Runner SSH CIDR: \`${{ steps.ssh.outputs.ssh_allowed_cidr }}\`"
+            echo
+            echo "### Terraform Outputs"
+            echo
+            echo "- Instance ID: \`${{ steps.tf_outputs.outputs.instance_id }}\`"
+            echo "- Public IP: \`${{ steps.tf_outputs.outputs.public_ip }}\`"
+            echo "- App URL: \`${{ steps.tf_outputs.outputs.app_url }}\`"
+            echo
+            echo "### Manual Destroy"
+            echo
+            echo "\`\`\`bash"
+            echo "cd /home/john/Github_Projects/terraform-ansible-infra/examples/ec2-docker-host"
+            echo "tmp_key=\"/tmp/ec2-docker-host-destroy-key-\$(date +%s)\""
+            echo "ssh-keygen -q -t ed25519 -N \"\" -f \"\$tmp_key\""
+            echo "AWS_PROFILE=Astral terraform init -reconfigure \\"
+            echo "  -backend-config=\"bucket=${{ steps.names.outputs.state_bucket_name }}\" \\"
+            echo "  -backend-config=\"key=${{ inputs.state_key }}\" \\"
+            echo "  -backend-config=\"region=${{ inputs.aws_region }}\" \\"
+            echo "  -backend-config=\"dynamodb_table=${{ steps.names.outputs.lock_table_name }}\" \\"
+            echo "  -backend-config=\"encrypt=true\""
+            echo "AWS_PROFILE=Astral terraform destroy \\"
+            echo "  -var=\"aws_region=${{ inputs.aws_region }}\" \\"
+            echo "  -var=\"name_prefix=${{ inputs.name_prefix }}\" \\"
+            echo "  -var=\"ssh_allowed_cidr=127.0.0.1/32\" \\"
+            echo "  -var=\"ssh_public_key=\$(cat \${tmp_key}.pub)\""
+            echo "rm -f \"\$tmp_key\" \"\${tmp_key}.pub\""
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
