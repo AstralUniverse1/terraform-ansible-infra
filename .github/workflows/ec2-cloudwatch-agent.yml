@@ -192,11 +192,10 @@ jobs:
             match_count="$(aws logs filter-log-events \
               --region "${{ inputs.aws_region }}" \
               --log-group-name "${{ steps.tf_outputs.outputs.log_group_name }}" \
-              --log-stream-names "${{ steps.tf_outputs.outputs.log_stream_name }}" \
               --start-time "$start_time" \
               --filter-pattern "\"${{ steps.runtime.outputs.marker }}\"" \
               --query 'length(events)' \
-              --output text)"
+              --output text 2>/dev/null || echo 0)"
 
             if [ "$match_count" != "0" ]; then
               exit 0
